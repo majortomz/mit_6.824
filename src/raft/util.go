@@ -1,13 +1,42 @@
 package raft
 
-import "log"
+import (
+	"log"
+	"time"
+)
 
 // Debugging
-const Debug = false
+const LEVEL = Disable
+
+const (
+	Trace   int = 1
+	Debug   int = 2
+	Info    int = 3
+	Warn    int = 4
+	Disable int = 1000
+)
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug {
+	if Debug >= LEVEL {
 		log.Printf(format, a...)
 	}
 	return
+}
+
+func TPrintf(format string, a ...interface{}) (n int, err error) {
+	if Trace >= LEVEL {
+		log.Printf(format, a...)
+	}
+	return
+}
+
+func WarnPrintf(format string, a ...interface{}) (n int, err error) {
+	if Warn >= LEVEL {
+		log.Printf(format, a...)
+	}
+	return
+}
+
+func CurrentMilliSeconds() int64 {
+	return time.Now().UnixNano() / int64(time.Millisecond)
 }

@@ -13,3 +13,4 @@ mrtmp.*
 mr-out-*
 mr-*
 .idea
+*.out
