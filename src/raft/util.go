@@ -30,6 +30,13 @@ func TPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+func InfoPrintf(format string, a ...interface{}) (n int, err error) {
+	if Info >= LEVEL {
+		log.Printf(format, a...)
+	}
+	return
+}
+
 func WarnPrintf(format string, a ...interface{}) (n int, err error) {
 	if Warn >= LEVEL {
 		log.Printf(format, a...)
@@ -39,4 +46,20 @@ func WarnPrintf(format string, a ...interface{}) (n int, err error) {
 
 func CurrentMilliSeconds() int64 {
 	return time.Now().UnixNano() / int64(time.Millisecond)
+}
+
+func Max(a int, b int) int {
+	if a > b {
+		return a
+	} else {
+		return b
+	}
+}
+
+func Min(a int, b int) int {
+	if a > b {
+		return b
+	} else {
+		return a
+	}
 }
