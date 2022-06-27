@@ -492,12 +492,18 @@ func (rf *Raft) killed() bool {
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
+	start := false
 	for rf.killed() == false {
 
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-		time.Sleep(time.Duration(100) * time.Millisecond)
+		if start {
+			time.Sleep(time.Duration(100) * time.Millisecond)
+		} else {
+			time.Sleep(time.Duration(rand.Int63n(150)) * time.Millisecond)
+		}
+		start = true
 		rf.mu.Lock()
 		if rf.state == LEADER ||
 			((rf.state == CANDIDATE) && CurrentMilliSeconds()-rf.electionStartTime <= rf.electionTimeout) ||
@@ -516,6 +522,8 @@ func (rf *Raft) ticker() {
 		rf.currentTerm += 1
 		rf.votedFor = rf.me
 		rf.votes = 1
+		rf.heartbeatTimeout = rand.Int63n(500) + 150
+		rf.electionTimeout = rand.Int63n(1000) + 500
 
 		req := RequestVoteArgs{}
 		req.Term = rf.currentTerm
@@ -783,7 +791,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = FOLLOWER
 	rf.applyChan = applyCh
 	rf.heartbeatTimeout = rand.Int63n(500) + 150
-	rf.electionTimeout = rand.Int63n(1500) + 500
+	rf.electionTimeout = rand.Int63n(1000) + 500
 	rf.lastAppliedIndex = 0
 	rf.firstEntryIndex = 0
 
