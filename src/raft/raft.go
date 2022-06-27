@@ -234,6 +234,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	lastLogTerm := 0
 	if CurrentMilliSeconds()-rf.lastLeaderReqTime <= rf.electionTimeout {
 		// reject vote, if election-timeout event doesn't happen in this node
+		TPrintf("Node-[%v] term:%v reject requestVote from Node-[%v] because of not see timeout. ", rf.me,
+			rf.currentTerm, args.CandidateId)
 		reply.VoteGranted = false
 		return
 	}
@@ -241,6 +243,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		lastLogIndex = rf.log[len(rf.log)-1].Index
 		lastLogTerm = rf.log[len(rf.log)-1].Term
 	}
+	TPrintf("Node-[%v] lastLogTerm:%v lastLogIndex:%v voteFor:%v", rf.me, lastLogTerm, lastLogIndex, rf.votedFor)
 	if args.Term > rf.currentTerm && (rf.state == CANDIDATE || rf.state == LEADER) {
 		// candidate's term is new and this node is in CANDIDATE state, this node return to follower state
 		rf.toFollowerState()
@@ -365,12 +368,20 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
+	done := make(chan bool, 1)
+	go func() {
+		done <- rf.peers[server].Call("Raft.RequestVote", args, reply)
+	}()
+	select {
+	case ok := <-done:
+		return ok
+	case <-time.After(time.Duration(time.Millisecond * 50)):
+		return false
+	}
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntryArgs, reply *AppendEntryReply) bool {
-	done := make(chan bool)
+	done := make(chan bool, 1)
 	go func() {
 		done <- rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	}()
@@ -623,10 +634,10 @@ func (rf *Raft) generateAppendReq(peer int, heartBeat bool) AppendEntryArgs {
 	if nextIndex >= 1 && memIndex < len(rf.log) {
 		if heartBeat {
 			if memIndex+1 < len(rf.log) {
-				entries = rf.log[memIndex:]
+				entries = append(entries, rf.log[memIndex:]...)
 			}
 		} else {
-			entries = rf.log[memIndex:]
+			entries = append(entries, rf.log[memIndex:]...)
 			if memIndex < len(rf.log) && rf.log[memIndex].Index != prevIndex+1 {
 				WarnPrintf("Node-[%v] prevLogIndex != nextEntryIndex + 1, prev:%v, nextEntry:%v.", rf.me,
 					prevIndex, rf.log[memIndex].Index)
