@@ -13,6 +13,7 @@ const (
 	Debug   int = 2
 	Info    int = 3
 	Warn    int = 4
+	Error   int = 5
 	Disable int = 1000
 )
 
@@ -39,6 +40,13 @@ func InfoPrintf(format string, a ...interface{}) (n int, err error) {
 
 func WarnPrintf(format string, a ...interface{}) (n int, err error) {
 	if Warn >= LEVEL {
+		log.Printf(format, a...)
+	}
+	return
+}
+
+func ErrorPrintf(format string, a ...interface{}) (n int, err error) {
+	if Error >= LEVEL {
 		log.Printf(format, a...)
 	}
 	return

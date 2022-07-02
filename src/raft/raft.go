@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"6.824/labgob"
+	"bytes"
 	"math/rand"
 	"sort"
 	"time"
@@ -124,12 +126,13 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -141,17 +144,25 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var voteFor int
+	var currentTerm int
+	var log []LogEntry
+	if d.Decode(&voteFor) != nil ||
+		d.Decode(&currentTerm) != nil ||
+		d.Decode(&log) != nil {
+		ErrorPrintf("Node-[%v] read persist fail, some data is null.", rf.me)
+	} else {
+		rf.votedFor = voteFor
+		rf.currentTerm = currentTerm
+		rf.log = log
+		if len(log) > 0 {
+			rf.firstEntryIndex = rf.log[0].Index
+		}
+		DPrintf("Node-[%v] read persist, voteFor:%v, currentTerm:%v, logSize:%v, log[last]:%v", rf.me,
+			rf.votedFor, rf.currentTerm, len(rf.log), rf.log[len(rf.log)-1])
+	}
 }
 
 //
@@ -257,11 +268,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.electionStartTime = CurrentMilliSeconds()
 		InfoPrintf("Node-[%v] vote for Node-[%v].", rf.me, args.CandidateId)
 		reply.VoteGranted = true
+		rf.persist()
 	}
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
-	DPrintf("Node-[%v] receive appendEntries from Node-[%v], empty:[%v]", rf.me, args.LeaderId, args.Entries == nil)
+	DPrintf("Node-[%v] receive appendEntries from Node-[%v], empty:[%v], leaderCommitIndex:[%v], prevLogIndex:[%v], "+
+		"prevLogTerm:[%v] entryDetail:[%v]",
+		rf.me, args.LeaderId, args.Entries == nil, args.LeaderCommitIndex, args.PrevLogIndex, args.PrevLogIndex, args.Entries)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
@@ -283,6 +297,8 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 
 	if len(rf.log) > 0 {
 		rf.firstEntryIndex = rf.log[0].Index
+	} else {
+		rf.firstEntryIndex = 0
 	}
 	prevLogMemIndex := rf.calculateMemArrayIndex(args.PrevLogIndex)
 	rf.lastLeaderReqTime = CurrentMilliSeconds()
@@ -300,11 +316,12 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 			reply.ConflictTerm = term
 			reply.ConflictStartIndex = rf.log[memIdx+1].Index
 			rf.log = rf.log[0:prevLogMemIndex]
-		} else if prevLogMemIndex > 0 && prevLogMemIndex > len(rf.log) {
+		} else if prevLogMemIndex > 0 && len(rf.log) > 0 && prevLogMemIndex > len(rf.log) {
 			memIdx := len(rf.log) - 1
 			reply.ConflictTerm = rf.log[memIdx].Term
 			reply.ConflictStartIndex = rf.log[memIdx].Index
 		}
+		rf.persist()
 		reply.Success = false
 		return
 	}
@@ -326,6 +343,7 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 	lastLogEntryIndex := 0
 	if len(rf.log) > 0 {
 		lastLogEntryIndex = rf.log[len(rf.log)-1].Index
+		rf.firstEntryIndex = rf.log[0].Index
 	}
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	if args.LeaderCommitIndex > rf.commitIndex {
@@ -335,6 +353,7 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 			rf.tryApplyMsg()
 		}
 	}
+	rf.persist()
 	reply.Success = true
 }
 
@@ -375,7 +394,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	select {
 	case ok := <-done:
 		return ok
-	case <-time.After(time.Duration(time.Millisecond * 50)):
+	case <-time.After(time.Duration(time.Millisecond * 30)):
 		return false
 	}
 }
@@ -388,7 +407,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntryArgs, reply *Appe
 	select {
 	case ok := <-done:
 		return ok
-	case <-time.After(time.Duration(time.Millisecond * 50)):
+	case <-time.After(time.Duration(time.Millisecond * 25)):
 		return false
 	}
 }
@@ -436,6 +455,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	newEntry.Command = command
 	// append entry to local log
 	rf.log = append(rf.log, newEntry)
+	TPrintf("Node-[%v] leader append log entry for term:%v index:%v command:%v.",
+		rf.me, rf.currentTerm, newEntry.Index, newEntry.Command)
 	rf.firstEntryIndex = rf.log[0].Index
 
 	rf.matchIndex[rf.me] = newEntry.Index
@@ -456,13 +477,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	latch.waitGroup.Wait()
 	// respond after entry applied to state machine
 	rf.mu.Lock()
+	// a leader never overwrites or deletes entries in its log; it only appends new entries
 	if latch.isOk() {
 		rf.tryUpdateCommitIdx()
-	} else {
-		rf.matchIndex[rf.me] = prevLogIndex
-		rf.log = rf.log[0 : prevLogIndex+1]
 	}
-	DPrintf("Node-[%v] isOk:%v, index:%v, term:%v command:[%v]", rf.me, latch.isOk(), newEntry.Index, term, command)
+	rf.persist()
+	DPrintf("Node-[%v] isOk:%v, index:%v, term:%v command:[%v], logSize:[%v]",
+		rf.me, latch.isOk(), newEntry.Index, term, command, len(rf.log))
 	rf.mu.Unlock()
 	rf.statMu.Unlock()
 	return newEntry.Index, term, true
@@ -572,7 +593,7 @@ func (rf *Raft) newElectionTask(peerIdx int, req RequestVoteArgs) {
 }
 
 func (rf *Raft) fromCandidateToLeader() {
-	WarnPrintf("Node-[%v] becomes leader.", rf.me)
+	WarnPrintf("Node-[%v] becomes leader for term [%v].", rf.me, rf.currentTerm)
 	rf.state = LEADER
 	rf.votedFor = -1
 	rf.votes = 0
@@ -639,9 +660,10 @@ func (rf *Raft) generateAppendReq(peer int, heartBeat bool) AppendEntryArgs {
 	if prevIndex > 0 && prevMemIndnex < len(rf.log) {
 		prevLogTerm = rf.log[prevMemIndnex].Term
 	}
+	TPrintf("Node-[%v] nextIndex:%v memIndex:%v logSize:%v", peer, nextIndex, memIndex, len(rf.log)-memIndex)
 	if nextIndex >= 1 && memIndex < len(rf.log) {
 		if heartBeat {
-			if memIndex+1 < len(rf.log) {
+			if memIndex < len(rf.log) {
 				entries = append(entries, rf.log[memIndex:]...)
 			}
 		} else {
@@ -682,7 +704,7 @@ func (rf *Raft) newAppendEntryTask(peer int, args *AppendEntryArgs, handler *App
 		handler.onResp(false)
 		return
 	}
-	if args.Term != rf.currentTerm || (rf.nextIndex[peer] > 0 && args.PrevLogIndex+1 != rf.nextIndex[peer]) {
+	if args.Term != rf.currentTerm || (rf.nextIndex[peer] >= 0 && args.PrevLogIndex+1 != rf.nextIndex[peer]) {
 		DPrintf("Node-[%v] ignore outdated AppendEntry response.", rf.me)
 		handler.onResp(false)
 		return
@@ -691,7 +713,7 @@ func (rf *Raft) newAppendEntryTask(peer int, args *AppendEntryArgs, handler *App
 	if reply.Success == false {
 		beforeNextIndex := rf.nextIndex[peer]
 		// decrement nextIndex and retry
-		if reply.ConflictTerm > 0 {
+		if reply.ConflictTerm > 0 && rf.nextIndex[peer] >= 1 {
 			prevIndex := rf.nextIndex[peer] - 2
 			for ; prevIndex > 0 && prevIndex >= reply.ConflictStartIndex; prevIndex-- {
 				memIdx := rf.calculateMemArrayIndex(prevIndex)
@@ -700,12 +722,16 @@ func (rf *Raft) newAppendEntryTask(peer int, args *AppendEntryArgs, handler *App
 				}
 			}
 			rf.nextIndex[peer] = prevIndex + 1
-		} else {
+		} else if rf.nextIndex[peer] >= 1 {
 			rf.nextIndex[peer] = rf.nextIndex[peer] - 1
+		} else {
+			TPrintf("Node-[%v] skip decrease Node-[%v] rf.nextIndex[peer] may be negative", rf.me, peer)
 		}
 		handler.onResp(false)
 		DPrintf("Node-[%v] decrease Node-[%v] nextIndex from [%v] to [%v], conflictTerm:%v, conflictIndex:%v.",
 			rf.me, peer, beforeNextIndex, rf.nextIndex[peer], reply.ConflictTerm, reply.ConflictStartIndex)
+		argsNew := rf.generateAppendReq(peer, true)
+		go rf.newAppendEntryTask(peer, &argsNew, handler)
 	} else {
 		// update nextIndex and matchIndex for follower
 		rf.nextIndex[peer] = Max(rf.nextIndex[peer], args.PrevLogIndex+len(args.Entries)+1)
@@ -760,6 +786,7 @@ func (rf *Raft) tryApplyMsg() {
 			applyMsg.Command = entry.Command
 			applyMsg.CommandValid = true
 			applyMsg.CommandIndex = entry.Index
+			TPrintf("Node-[%v] apply channel for commandIndex:[%v]", rf.me, entry.Index)
 			rf.applyChan <- applyMsg
 			rf.lastAppliedIndex = i
 		}
