@@ -96,7 +96,9 @@ type Raft struct {
 	log              []LogEntry
 	commitIndex      int
 	lastAppliedIndex int
-	firstEntryIndex  int
+
+	lastIncludeIndex int
+	lastIncludeTerm  int
 
 	// leader only
 	readyForServing bool
@@ -126,13 +128,19 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
+	rf.persister.SaveRaftState(rf.encodeState())
+}
+
+func (rf *Raft) encodeState() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.currentTerm)
+	e.Encode(rf.lastIncludeTerm)
+	e.Encode(rf.lastIncludeIndex)
 	e.Encode(rf.log)
 	data := w.Bytes()
-	rf.persister.SaveRaftState(data)
+	return data
 }
 
 //
@@ -148,20 +156,30 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 	var voteFor int
 	var currentTerm int
+	var lastIncludeTerm int
+	var lastIncludeIndex int
 	var log []LogEntry
 	if d.Decode(&voteFor) != nil ||
 		d.Decode(&currentTerm) != nil ||
+		d.Decode(&lastIncludeTerm) != nil ||
+		d.Decode(&lastIncludeIndex) != nil ||
 		d.Decode(&log) != nil {
 		ErrorPrintf("Node-[%v] read persist fail, some data is null.", rf.me)
 	} else {
 		rf.votedFor = voteFor
 		rf.currentTerm = currentTerm
+		rf.lastIncludeTerm = lastIncludeTerm
+		rf.lastIncludeIndex = lastIncludeIndex
+		rf.lastAppliedIndex = lastIncludeIndex
 		rf.log = log
-		if len(log) > 0 {
-			rf.firstEntryIndex = rf.log[0].Index
+		if len(rf.log) > 0 {
+			DPrintf("Node-[%v] read persist, voteFor:%v, currentTerm:%v, logSize:%v, log[last]:%v", rf.me,
+				rf.votedFor, rf.currentTerm, len(rf.log), rf.log[len(rf.log)-1])
+		} else {
+			DPrintf("Node-[%v] read persist, voteFor:%v, currentTerm:%v, logSize:%v, log[last]:%v", rf.me,
+				rf.votedFor, rf.currentTerm, len(rf.log), nil)
 		}
-		DPrintf("Node-[%v] read persist, voteFor:%v, currentTerm:%v, logSize:%v, log[last]:%v", rf.me,
-			rf.votedFor, rf.currentTerm, len(rf.log), rf.log[len(rf.log)-1])
+
 	}
 }
 
@@ -182,7 +200,49 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	go func() {
+		TPrintf("Node-[%v] Snapshot start", rf.me)
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		TPrintf("Node-[%v] Snapshot acquire lock", rf.me)
+		if index <= 0 {
+			return
+		}
 
+		if len(rf.log) == 0 {
+			ErrorPrintf("Node-[%v] Snapshot, but log entry size is 0.", rf.me)
+			return
+		}
+		if rf.lastIncludeIndex >= index {
+			WarnPrintf("Node-[%v] Snapshot lastIncludeIndex:%v gt index:%v", rf.me, rf.lastIncludeIndex, index)
+			return
+		}
+
+		memIdx := rf.calculateMemArrayIndex(index)
+		if memIdx <= 0 || memIdx >= len(rf.log) {
+			ErrorPrintf("Node-[%v] Snapshot, memIdx is beyond log entry size. index:%v memIdx:%v logSize:%v",
+				rf.me, index, memIdx, len(rf.log))
+			return
+		}
+
+		entry := rf.log[memIdx]
+		if entry.Index != index {
+			ErrorPrintf("Node-[%v] Snapshot conflicting index, memIdx %v. EntryIndex:%v InputIndex:%v ", rf.me, memIdx, entry.Index, index)
+			return
+		}
+		if memIdx+1 < len(rf.log) {
+			rf.log = rf.log[memIdx+1:]
+		} else {
+			rf.log = []LogEntry{}
+		}
+		rf.lastIncludeIndex = entry.Index
+		rf.lastIncludeTerm = entry.Term
+		rf.lastAppliedIndex = Max(rf.lastAppliedIndex, rf.lastIncludeIndex)
+
+		rf.persister.SaveStateAndSnapshot(rf.encodeState(), snapshot)
+		TPrintf("Node-[%v] Snapshot finished with lastIncludeIndex:%v lastIncludeTerm:%v.", rf.me,
+			rf.lastIncludeIndex, rf.lastIncludeTerm)
+	}()
 }
 
 //
@@ -225,8 +285,20 @@ type AppendEntryReply struct {
 	ConflictStartIndex int
 }
 
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludeTerm   int
+	Data              []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
 func (rf *Raft) calculateMemArrayIndex(index int) int {
-	return index - rf.firstEntryIndex
+	return index - rf.lastIncludeIndex - 1
 }
 
 //
@@ -241,8 +313,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.VoteForTerm = args.Term
 	reply.VoteGranted = false
 	reply.Term = rf.currentTerm
-	lastLogIndex := 0
-	lastLogTerm := 0
+	lastLogIndex := rf.lastIncludeIndex
+	lastLogTerm := rf.lastIncludeTerm
 	if CurrentMilliSeconds()-rf.lastLeaderReqTime <= rf.electionTimeout {
 		// reject vote, if election-timeout event doesn't happen in this node
 		TPrintf("Node-[%v] term:%v reject requestVote from Node-[%v] because of not see timeout. ", rf.me,
@@ -275,7 +347,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 	DPrintf("Node-[%v] receive appendEntries from Node-[%v], empty:[%v], leaderCommitIndex:[%v], prevLogIndex:[%v], "+
 		"prevLogTerm:[%v] entryDetail:[%v]",
-		rf.me, args.LeaderId, args.Entries == nil, args.LeaderCommitIndex, args.PrevLogIndex, args.PrevLogIndex, args.Entries)
+		rf.me, args.LeaderId, args.Entries == nil, args.LeaderCommitIndex, args.PrevLogIndex, args.PrevLogTerm, args.Entries)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
@@ -294,34 +366,45 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 		rf.toFollowerState()
 		rf.currentTerm = args.Term
 	}
-
-	if len(rf.log) > 0 {
-		rf.firstEntryIndex = rf.log[0].Index
-	} else {
-		rf.firstEntryIndex = 0
-	}
 	prevLogMemIndex := rf.calculateMemArrayIndex(args.PrevLogIndex)
 	rf.lastLeaderReqTime = CurrentMilliSeconds()
+	prevEntryIndex := rf.lastIncludeIndex
+	prevEntryTerm := rf.lastIncludeTerm
+	if len(rf.log) > 0 && prevLogMemIndex > 0 && prevLogMemIndex < len(rf.log) {
+		prevEntryIndex = rf.log[prevLogMemIndex].Index
+		prevEntryTerm = rf.log[prevLogMemIndex].Term
+	}
+
+	DPrintf("Node-[%v] prevIndex:%v, prevTerm:%v, lastIncludeIndex:%v", rf.me, prevEntryIndex, prevEntryTerm, rf.lastIncludeIndex)
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
-	if prevLogMemIndex < 0 ||
-		(args.PrevLogIndex > 0 && (prevLogMemIndex >= len(rf.log) || rf.log[prevLogMemIndex].Term != args.PrevLogTerm)) {
-		DPrintf("Node-[%v] AppendEntries reply false because of no entry for %v, memIdx:%v, reqTerm:[%v]",
-			rf.me, args.PrevLogIndex, prevLogMemIndex, args.PrevLogTerm)
+	if prevEntryTerm != args.PrevLogTerm || prevEntryIndex != args.PrevLogIndex {
+		DPrintf("Node-[%v] AppendEntries reply false because of no entry for %v, memIdx:%v, prevIndex:%v, prevTerm:%v, reqTerm:[%v]",
+			rf.me, args.PrevLogIndex, prevLogMemIndex, prevEntryIndex, prevEntryTerm, args.PrevLogTerm)
 		// truncate conflict
-		if prevLogMemIndex > 0 && prevLogMemIndex < len(rf.log) && rf.log[prevLogMemIndex].Term != args.Term {
-			memIdx := prevLogMemIndex - 1
-			term := rf.log[prevLogMemIndex].Term
-			for ; memIdx >= 0 && rf.log[memIdx].Term == term; memIdx-- {
+		if prevLogMemIndex >= 0 {
+			if prevLogMemIndex < len(rf.log) {
+				memIdx := prevLogMemIndex - 1
+				term := args.Term
+				for ; memIdx >= 0 && rf.log[memIdx].Term == term; memIdx-- {
+				}
+				reply.ConflictTerm = term
+				reply.ConflictStartIndex = rf.log[memIdx+1].Index
+				rf.log = rf.log[0:prevLogMemIndex]
+			} else if len(rf.log) > 0 && prevLogMemIndex >= len(rf.log) {
+				memIdx := len(rf.log) - 1
+				reply.ConflictTerm = rf.log[memIdx].Term
+				reply.ConflictStartIndex = rf.log[memIdx].Index
+			} else {
+				reply.ConflictTerm = prevEntryTerm
+				reply.ConflictStartIndex = prevEntryIndex
 			}
-			reply.ConflictTerm = term
-			reply.ConflictStartIndex = rf.log[memIdx+1].Index
-			rf.log = rf.log[0:prevLogMemIndex]
-		} else if prevLogMemIndex > 0 && len(rf.log) > 0 && prevLogMemIndex > len(rf.log) {
-			memIdx := len(rf.log) - 1
-			reply.ConflictTerm = rf.log[memIdx].Term
-			reply.ConflictStartIndex = rf.log[memIdx].Index
+		} else {
+			reply.ConflictTerm = prevEntryTerm
+			reply.ConflictStartIndex = prevEntryIndex
 		}
 		rf.persist()
+		TPrintf("Node-[%v] AppendEntries reply conflictTerm:%v conflictIndex:%v ", rf.me, reply.ConflictTerm,
+			reply.ConflictStartIndex)
 		reply.Success = false
 		return
 	}
@@ -340,21 +423,59 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 		}
 	}
 
-	lastLogEntryIndex := 0
+	lastLogEntryIndex := rf.lastIncludeIndex
 	if len(rf.log) > 0 {
 		lastLogEntryIndex = rf.log[len(rf.log)-1].Index
-		rf.firstEntryIndex = rf.log[0].Index
 	}
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	if args.LeaderCommitIndex > rf.commitIndex {
 		newCommitIndex := Min(args.LeaderCommitIndex, lastLogEntryIndex)
-		if rf.log[rf.calculateMemArrayIndex(newCommitIndex)].Term == args.Term {
+		newCommitMemIndex := rf.calculateMemArrayIndex(newCommitIndex)
+		if newCommitMemIndex >= 0 && rf.log[newCommitMemIndex].Term == args.Term {
 			rf.commitIndex = newCommitIndex
 			rf.tryApplyMsg()
 		}
 	}
 	rf.persist()
 	reply.Success = true
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	TPrintf("Node-[%v] receive InstallSnapshot from Node-[%v], req LastIncludedIndex:%v, req LastIncludeTerm:%v.",
+		rf.me, args.LeaderId, args.LastIncludedIndex, args.LastIncludeTerm)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	reply.Term = rf.currentTerm
+	if rf.currentTerm > args.Term {
+		return
+	}
+	if rf.lastIncludeIndex >= args.LastIncludedIndex {
+		TPrintf("Node-[%v] ignore InstallSnapshot from Node-[%v], current lastIncludeIndex:%v term:%v , "+
+			"req LastIncludedIndex:%v term:%v",
+			rf.me, args.LeaderId, rf.lastIncludeIndex, rf.lastIncludeTerm, args.LastIncludedIndex, args.LastIncludeTerm)
+		return
+	}
+	// rf.Snapshot(args.LastIncludedIndex, args.Data)
+	memIdx := rf.calculateMemArrayIndex(args.LastIncludedIndex)
+	if memIdx+1 < len(rf.log) {
+		rf.log = rf.log[memIdx+1:]
+	} else {
+		rf.log = []LogEntry{}
+	}
+	rf.lastIncludeIndex = args.LastIncludedIndex
+	rf.lastIncludeTerm = args.LastIncludeTerm
+	rf.lastAppliedIndex = Max(rf.lastAppliedIndex, rf.lastIncludeIndex)
+	rf.persister.SaveStateAndSnapshot(rf.encodeState(), args.Data)
+	TPrintf("Node-[%v] InstallSnapshot finished with lastIncludeIndex:%v lastIncludeTerm:%v.", rf.me,
+		rf.lastIncludeIndex, rf.lastIncludeTerm)
+
+	applyMsg := ApplyMsg{}
+	applyMsg.CommandValid = false
+	applyMsg.SnapshotValid = true
+	applyMsg.Snapshot = args.Data
+	applyMsg.SnapshotTerm = args.LastIncludeTerm
+	applyMsg.SnapshotIndex = args.LastIncludedIndex
+	rf.applyChan <- applyMsg
 }
 
 //
@@ -407,7 +528,20 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntryArgs, reply *Appe
 	select {
 	case ok := <-done:
 		return ok
-	case <-time.After(time.Duration(time.Millisecond * 25)):
+	case <-time.After(time.Duration(time.Millisecond * 30)):
+		return false
+	}
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	done := make(chan bool, 1)
+	go func() {
+		done <- rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	}()
+	select {
+	case ok := <-done:
+		return ok
+	case <-time.After(time.Duration(time.Millisecond * 30)):
 		return false
 	}
 }
@@ -445,7 +579,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	// Your code here (2B).
-	prevLogIndex := 0
+	prevLogIndex := rf.lastIncludeIndex
 	if len(rf.log) > 0 {
 		prevLogIndex = rf.log[len(rf.log)-1].Index
 	}
@@ -457,8 +591,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.log = append(rf.log, newEntry)
 	TPrintf("Node-[%v] leader append log entry for term:%v index:%v command:%v.",
 		rf.me, rf.currentTerm, newEntry.Index, newEntry.Command)
-	rf.firstEntryIndex = rf.log[0].Index
-
 	rf.matchIndex[rf.me] = newEntry.Index
 
 	latch := AppendEntryHandler{waitGroup: &sync.WaitGroup{}, threshold: rf.majorityCount}
@@ -553,6 +685,9 @@ func (rf *Raft) ticker() {
 			entry := rf.log[len(rf.log)-1]
 			req.LastLogTerm = entry.Term
 			req.LastLogIndex = entry.Index
+		} else {
+			req.LastLogTerm = rf.lastIncludeTerm
+			req.LastLogIndex = rf.lastIncludeIndex
 		}
 		for i := 0; i < len(rf.peers); i++ {
 			if i == rf.me {
@@ -601,7 +736,7 @@ func (rf *Raft) fromCandidateToLeader() {
 
 	rf.readyForServing = false
 	rf.nextIndex = make([]int, len(rf.peers))
-	prevLogIndex := 0
+	prevLogIndex := rf.lastIncludeIndex
 	if len(rf.log) > 0 {
 		prevLogIndex = rf.log[len(rf.log)-1].Index
 	}
@@ -651,17 +786,23 @@ func (rf *Raft) heartbeatEntryTicker() {
 }
 
 func (rf *Raft) generateAppendReq(peer int, heartBeat bool) AppendEntryArgs {
+	if rf.nextIndex[peer] <= rf.lastIncludeIndex {
+		rf.nextIndex[peer] = rf.lastIncludeIndex + 1
+	}
 	nextIndex := rf.nextIndex[peer]
 	prevIndex := nextIndex - 1
 	prevLogTerm := 0
 	var entries []LogEntry
 	memIndex := rf.calculateMemArrayIndex(nextIndex)
 	prevMemIndnex := rf.calculateMemArrayIndex(prevIndex)
-	if prevIndex > 0 && prevMemIndnex < len(rf.log) {
+	if prevMemIndnex >= 0 {
 		prevLogTerm = rf.log[prevMemIndnex].Term
+	} else {
+		prevIndex = rf.lastIncludeIndex
+		prevLogTerm = rf.lastIncludeTerm
 	}
 	TPrintf("Node-[%v] nextIndex:%v memIndex:%v logSize:%v", peer, nextIndex, memIndex, len(rf.log)-memIndex)
-	if nextIndex >= 1 && memIndex < len(rf.log) {
+	if nextIndex >= 1 && memIndex >= 0 && memIndex < len(rf.log) {
 		if heartBeat {
 			if memIndex < len(rf.log) {
 				entries = append(entries, rf.log[memIndex:]...)
@@ -669,8 +810,8 @@ func (rf *Raft) generateAppendReq(peer int, heartBeat bool) AppendEntryArgs {
 		} else {
 			entries = append(entries, rf.log[memIndex:]...)
 			if memIndex < len(rf.log) && rf.log[memIndex].Index != prevIndex+1 {
-				WarnPrintf("Node-[%v] prevLogIndex != nextEntryIndex + 1, prev:%v, nextEntry:%v.", rf.me,
-					prevIndex, rf.log[memIndex].Index)
+				WarnPrintf("Node-[%v] prevLogIndex != nextEntryIndex + 1, prev:%v, next:%v, entryNext:%v.", rf.me,
+					prevIndex, nextIndex, rf.log[memIndex].Index)
 			}
 		}
 	}
@@ -705,7 +846,7 @@ func (rf *Raft) newAppendEntryTask(peer int, args *AppendEntryArgs, handler *App
 		return
 	}
 	if args.Term != rf.currentTerm || (rf.nextIndex[peer] >= 0 && args.PrevLogIndex+1 != rf.nextIndex[peer]) {
-		DPrintf("Node-[%v] ignore outdated AppendEntry response.", rf.me)
+		DPrintf("Node-[%v] ignore outdated AppendEntry response from Node-[%v].", rf.me, peer)
 		handler.onResp(false)
 		return
 	}
@@ -713,9 +854,16 @@ func (rf *Raft) newAppendEntryTask(peer int, args *AppendEntryArgs, handler *App
 	if reply.Success == false {
 		beforeNextIndex := rf.nextIndex[peer]
 		// decrement nextIndex and retry
+		// TODO determine if need insntallSnaphsot
+		if rf.lastIncludeIndex > 0 && reply.ConflictStartIndex < rf.lastIncludeIndex {
+			snapshotArgs := rf.generateInstallSnapshotReq(peer)
+			go rf.newInstallSnapshotTask(peer, &snapshotArgs)
+			handler.onResp(false)
+			return
+		}
 		if reply.ConflictTerm > 0 && rf.nextIndex[peer] >= 1 {
 			prevIndex := rf.nextIndex[peer] - 2
-			for ; prevIndex > 0 && prevIndex >= reply.ConflictStartIndex; prevIndex-- {
+			for ; prevIndex > rf.lastIncludeIndex && prevIndex >= reply.ConflictStartIndex; prevIndex-- {
 				memIdx := rf.calculateMemArrayIndex(prevIndex)
 				if rf.log[memIdx].Term == reply.ConflictTerm {
 					break
@@ -752,6 +900,30 @@ func (rf *Raft) newAppendEntryTask(peer int, args *AppendEntryArgs, handler *App
 	}
 }
 
+func (rf *Raft) generateInstallSnapshotReq(peer int) InstallSnapshotArgs {
+	args := InstallSnapshotArgs{}
+	args.Term = rf.currentTerm
+	args.LeaderId = rf.me
+	args.LastIncludedIndex = rf.lastIncludeIndex
+	args.LastIncludeTerm = rf.lastIncludeTerm
+	args.Data = rf.persister.ReadSnapshot()
+	return args
+}
+
+func (rf *Raft) newInstallSnapshotTask(peer int, args *InstallSnapshotArgs) {
+	reply := InstallSnapshotReply{}
+	TPrintf("Node:[%v] send InstallSnapshot to Node:[%v].", rf.me, peer)
+	ok := rf.sendInstallSnapshot(peer, args, &reply)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if !ok {
+		return
+	}
+	if reply.Term > rf.currentTerm {
+		rf.toFollowerState()
+	}
+}
+
 func (rf *Raft) tryUpdateCommitIdx() {
 	if rf.state != LEADER {
 		return
@@ -761,10 +933,11 @@ func (rf *Raft) tryUpdateCommitIdx() {
 	count := 0
 	idxArr := make([]int, 0)
 	for _, idx := range rf.matchIndex {
-		if idx <= 0 {
+		memIdx := rf.calculateMemArrayIndex(idx)
+		if memIdx < 0 {
 			continue
 		}
-		entry := rf.log[rf.calculateMemArrayIndex(idx)]
+		entry := rf.log[memIdx]
 		if entry.Term == rf.currentTerm {
 			idxArr = append(idxArr, entry.Index)
 			count++
@@ -820,7 +993,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.heartbeatTimeout = rand.Int63n(500) + 150
 	rf.electionTimeout = rand.Int63n(1000) + 500
 	rf.lastAppliedIndex = 0
-	rf.firstEntryIndex = 0
 
 	TPrintf("Node-[%v] election timeout:[%v] ms, heartbeat timeout:[%v]ms", rf.me, rf.electionTimeout,
 		rf.heartbeatTimeout)
